@@ -1,0 +1,2 @@
+-- AlterEnum
+ALTER TYPE "RegimeTributario" ADD VALUE 'SIMPLES_NACIONAL_MEI';

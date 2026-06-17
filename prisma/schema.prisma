@@ -9,26 +9,230 @@ generator client {
 // enough when changing adapters.
 // See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 model Session {
-  id            String    @id
-  shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
+}
+
+// ---------------------------------------------------------------------------
+// EZ Nota domain models (multi-tenant, scoped by shopId)
+// ---------------------------------------------------------------------------
+
+enum ShopStatus {
+  ACTIVE
+  UNINSTALLED
+}
+
+enum PlanTier {
+  TRIAL
+  STARTER
+  GROWTH
+  PRO
+}
+
+enum RegimeTributario {
+  SIMPLES_NACIONAL
+  SIMPLES_NACIONAL_MEI
+  SIMPLES_EXCESSO_SUBLIMITE
+  REGIME_NORMAL
+}
+
+enum FiscalEngineProvider {
+  FOCUS_NFE
+  PLUGNOTAS
+  NFE_IO
+}
+
+enum EmitenteStatus {
+  PENDING_SETUP
+  ACTIVE
+  SUSPENDED
+}
+
+enum CertificateStatus {
+  ACTIVE
+  EXPIRING_SOON
+  EXPIRED
+  INVALID
+}
+
+enum Ambiente {
+  HOMOLOGACAO
+  PRODUCAO
+}
+
+enum TipoDocumento {
+  NFE
+  NFCE
+}
+
+enum InvoiceStatus {
+  PENDING
+  PROCESSING
+  AUTHORIZED
+  REJECTED
+  CANCELLED
+  ERROR
+}
+
+// The tenant. One row per installed Shopify shop; all domain data hangs off this.
+model Shop {
+  id            String     @id @default(cuid())
+  shopDomain    String     @unique
+  status        ShopStatus @default(ACTIVE)
+  planTier      PlanTier   @default(TRIAL)
+  installedAt   DateTime   @default(now())
+  uninstalledAt DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  emitentes             Emitente[]
+  invoices              Invoice[]
+  productFiscalMappings ProductFiscalMapping[]
+}
+
+// Fiscal identity of the merchant. One Emitente per Shop for MVP, modeled as a
+// relation to allow future multi-CNPJ.
+model Emitente {
+  id                       String               @id @default(cuid())
+  shopId                   String
+  shop                     Shop                 @relation(fields: [shopId], references: [id])
+  cnpj                     String
+  razaoSocial              String
+  nomeFantasia             String?
+  inscricaoEstadual        String
+  inscricaoMunicipal       String?
+  regimeTributario         RegimeTributario     @default(SIMPLES_NACIONAL)
+  regimeEspecialTributacao String?
+  logradouro               String
+  numero                   String
+  complemento              String?
+  bairro                   String
+  codigoMunicipioIbge      String
+  municipio                String
+  uf                       String
+  cep                      String
+  telefone                 String?
+  email                    String?
+  fiscalEngineProvider     FiscalEngineProvider @default(FOCUS_NFE)
+  // Reference to the "empresa" held by the fiscal engine (Focus). The A1 .pfx
+  // and its password are NEVER stored here — custody is delegated to the engine.
+  fiscalEngineCompanyRef   String?
+  status                   EmitenteStatus       @default(PENDING_SETUP)
+  createdAt                DateTime             @default(now())
+  updatedAt                DateTime             @updatedAt
+
+  certificate    Certificate?
+  fiscalSettings FiscalSettings?
+  invoices       Invoice[]
+
+  @@unique([shopId, cnpj])
+}
+
+// Certificate METADATA ONLY. The .pfx and password live at the fiscal engine,
+// never persisted here — only expiry/identity fields for alerting.
+model Certificate {
+  id          String            @id @default(cuid())
+  emitenteId  String            @unique
+  emitente    Emitente          @relation(fields: [emitenteId], references: [id])
+  subjectCnpj String?
+  validFrom   DateTime?
+  validTo     DateTime?
+  status      CertificateStatus @default(ACTIVE)
+  uploadedAt  DateTime          @default(now())
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+}
+
+// Emission defaults, 1:1 with Emitente.
+model FiscalSettings {
+  id                 String        @id @default(cuid())
+  emitenteId         String        @unique
+  emitente           Emitente      @relation(fields: [emitenteId], references: [id])
+  ambiente           Ambiente      @default(HOMOLOGACAO)
+  tipoDocumento      TipoDocumento @default(NFE)
+  serie              Int           @default(1)
+  proximoNumero      Int           @default(1)
+  naturezaOperacao   String        @default("Venda de mercadoria")
+  defaultCfop        String        @default("5102")
+  defaultCsosn       String        @default("102")
+  defaultOrigem      String        @default("0")
+  defaultNcm         String?
+  emiteAposPagamento Boolean       @default(true)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+}
+
+// Fiscal attributes per product variant.
+model ProductFiscalMapping {
+  id               String   @id @default(cuid())
+  shopId           String
+  shop             Shop     @relation(fields: [shopId], references: [id])
+  shopifyProductId String?
+  shopifyVariantId String
+  ncm              String
+  cfop             String?
+  csosn            String?
+  origem           String?
+  cest             String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([shopId, shopifyVariantId])
+}
+
+// Each issued note, linked to a Shopify order. idempotencyKey guarantees we
+// never emit a duplicate NF-e for the same order.
+model Invoice {
+  id               String        @id @default(cuid())
+  shopId           String
+  shop             Shop          @relation(fields: [shopId], references: [id])
+  emitenteId       String
+  emitente         Emitente      @relation(fields: [emitenteId], references: [id])
+  shopifyOrderId   String
+  shopifyOrderName String?
+  tipo             TipoDocumento @default(NFE)
+  status           InvoiceStatus @default(PENDING)
+  ambiente         Ambiente
+  fiscalEngineRef  String?
+  numero           Int?
+  serie            Int?
+  chaveAcesso      String?
+  protocolo        String?
+  xmlUrl           String?
+  danfeUrl         String?
+  valorTotal       Decimal?      @db.Decimal(12, 2)
+  mensagemSefaz    String?
+  rejeicaoCodigo   String?
+  idempotencyKey   String        @unique
+  requestPayload   Json?
+  responsePayload  Json?
+  emittedAt        DateTime?
+  authorizedAt     DateTime?
+  cancelledAt      DateTime?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  @@index([shopId, shopifyOrderId])
+  @@index([status])
 }

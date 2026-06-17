@@ -74,6 +74,18 @@ module.exports = {
         "plugin:import/recommended",
         "plugin:import/typescript",
       ],
+      rules: {
+        // Allow intentionally-unused args/vars when prefixed with "_"
+        // (e.g. interface-required params in stubbed adapter methods).
+        "@typescript-eslint/no-unused-vars": [
+          "error",
+          {
+            argsIgnorePattern: "^_",
+            varsIgnorePattern: "^_",
+            caughtErrorsIgnorePattern: "^_",
+          },
+        ],
+      },
     },
 
     // Node
