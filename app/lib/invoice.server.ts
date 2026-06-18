@@ -1,11 +1,18 @@
 import { EmitenteStatus, InvoiceStatus, Prisma } from "@prisma/client";
 import prisma from "../db.server";
 import { getFiscalEngine } from "./fiscal";
-import type { EmissionStatus, EmitInvoiceResult } from "./fiscal";
+import type { EmissionStatus, EmitInvoiceInput, EmitInvoiceResult } from "./fiscal";
+import { buildEmissionInput } from "./fiscal/order-mapping";
 import {
-  buildEmissionInput,
+  fetchFiscalOrder,
+  fiscalOrderFromWebhookPayload,
+  type AdminGraphqlClient,
+  type FiscalOrder,
   type ShopifyOrderPayload,
-} from "./fiscal/order-mapping";
+} from "./fiscal/shopify-order.server";
+import { lookupCep } from "./lookup/viacep.server";
+import type { CepLookupResult } from "./lookup/types";
+import { isValidCep, onlyDigits } from "./validation/br-documents";
 
 const TO_INVOICE_STATUS: Record<EmissionStatus, InvoiceStatus> = {
   AUTHORIZED: InvoiceStatus.AUTHORIZED,
@@ -22,20 +29,32 @@ function isUniqueViolation(error: unknown): boolean {
   );
 }
 
+/** Marks an Invoice ERROR with a message. No emittedAt (nothing was emitted) — L4. */
+function markInvoiceError(invoiceId: string, message: string) {
+  return prisma.invoice.update({
+    where: { id: invoiceId },
+    data: { status: InvoiceStatus.ERROR, mensagemSefaz: message },
+  });
+}
+
 /**
  * Emits an NF-e for a paid Shopify order. Everything is scoped by shopId.
  * Idempotent: a unique Invoice.idempotencyKey (shopId:orderId) means a duplicate
  * webhook never re-emits an authorized/processing note (CLAUDE.md decision #4),
  * while a previously failed (ERROR/REJECTED) note is reclaimed for a legit retry.
  *
- * NOTE: emission runs synchronously here. With the real Focus integration this
- * should move to a queue (and poll processando→autorizado) — next chunk.
+ * Order data is enriched via Admin GraphQL (CPF via localizedFields, NCM via the
+ * variant's HS code). LGPD/L8: never log CPF/address.
+ *
+ * NOTE: emission runs synchronously; with the real Focus integration this should
+ * move to a queue (+ poll processando→autorizado, + recover stuck PROCESSING) — M1.
  */
 export async function handleOrderPaid(
   shopDomain: string,
-  order: ShopifyOrderPayload,
+  payload: ShopifyOrderPayload,
+  admin?: AdminGraphqlClient,
 ): Promise<void> {
-  const orderId = order.id != null ? String(order.id) : "";
+  const orderId = payload.id != null ? String(payload.id) : "";
   if (!orderId) {
     console.log("[orders/paid] payload sem id de pedido; ignorando");
     return;
@@ -68,7 +87,7 @@ export async function handleOrderPaid(
         shopId: shop.id,
         emitenteId: emitente.id,
         shopifyOrderId: orderId,
-        shopifyOrderName: order.name ?? null,
+        shopifyOrderName: payload.name ?? null,
         idempotencyKey,
         ambiente: settings.ambiente,
         tipo: settings.tipoDocumento,
@@ -84,7 +103,6 @@ export async function handleOrderPaid(
       select: { id: true, status: true },
     });
     if (!existing) throw error;
-    // Já autorizada / em processamento / cancelada → não reemite.
     if (
       existing.status === InvoiceStatus.AUTHORIZED ||
       existing.status === InvoiceStatus.PROCESSING ||
@@ -95,7 +113,6 @@ export async function handleOrderPaid(
       );
       return;
     }
-    // ERROR/REJECTED → retry legítimo: reivindica a linha atomicamente.
     const claimed = await prisma.invoice.updateMany({
       where: { id: existing.id, status: existing.status },
       data: {
@@ -113,11 +130,43 @@ export async function handleOrderPaid(
     invoiceId = existing.id;
   }
 
-  // --- Numeração + montagem do payload ---
-  const numero = settings.proximoNumero;
-  const variantIds = (order.line_items ?? [])
-    .map((li) => (li.variant_id != null ? String(li.variant_id) : ""))
-    .filter(Boolean);
+  // --- Dados do pedido: GraphQL (primário) → fallback do payload do webhook ---
+  let order: FiscalOrder;
+  if (admin) {
+    try {
+      order = await fetchFiscalOrder(admin, `gid://shopify/Order/${orderId}`);
+    } catch {
+      // L5: com admin disponível, NÃO emitir com dados degradados — registra ERROR
+      // (reemitível) e relança para o Shopify reenviar o webhook. Log sem PII.
+      console.error(`[orders/paid] consulta do pedido ${orderId} no Shopify falhou`);
+      await markInvoiceError(
+        invoiceId,
+        "Falha ao consultar o pedido no Shopify; será reprocessado.",
+      );
+      throw new Error(`order fetch failed (${orderId})`);
+    }
+  } else {
+    order = fiscalOrderFromWebhookPayload(payload);
+    console.log(
+      `[orders/paid] ${orderId}: sessão admin indisponível; usando payload do webhook (degradado)`,
+    );
+  }
+
+  // IBGE/bairro/município do destinatário via ViaCEP (best-effort).
+  let destinatarioCep: CepLookupResult | null = null;
+  const destCep = onlyDigits(order.enderecoEntrega?.zip ?? "");
+  if (isValidCep(destCep)) {
+    try {
+      destinatarioCep = await lookupCep(destCep);
+    } catch {
+      /* best-effort; segue sem o IBGE */
+    }
+  }
+
+  // --- Mapeamento + validação fiscal ---
+  const variantIds = order.itens
+    .map((i) => i.variantId)
+    .filter((v): v is string => !!v);
   const mappings = variantIds.length
     ? await prisma.productFiscalMapping.findMany({
         where: { shopId: shop.id, shopifyVariantId: { in: variantIds } },
@@ -125,12 +174,31 @@ export async function handleOrderPaid(
     : [];
   const productMappings = new Map(mappings.map((m) => [m.shopifyVariantId, m]));
 
-  const input = buildEmissionInput({
+  const build = buildEmissionInput({
     emitente: { ...emitente, fiscalSettings: settings },
     order,
     productMappings,
-    numero,
+    idempotencyKey,
+    destinatarioCep,
   });
+
+  // NCM ausente / exterior / >100 itens → ERROR permanente (sem emitir, sem numerar).
+  if (!build.ok) {
+    await markInvoiceError(invoiceId, build.error);
+    console.log(`[orders/paid] pedido ${orderId} → ERROR (${build.error})`);
+    return;
+  }
+
+  // --- M2: reserva o número ATOMICAMENTE antes de emitir ---
+  // Incremento atômico evita número duplicado sob concorrência (decisão #4).
+  // Aceita gaps: uma rejeição/erro "queima" o número (resolvível por inutilização).
+  const reserved = await prisma.fiscalSettings.update({
+    where: { id: settings.id },
+    data: { proximoNumero: { increment: 1 } },
+    select: { proximoNumero: true },
+  });
+  const numero = reserved.proximoNumero - 1;
+  const input: EmitInvoiceInput = { ...build.input, numero };
 
   // --- Emissão via adapter (stub) ---
   let result: EmitInvoiceResult;
@@ -161,43 +229,31 @@ export async function handleOrderPaid(
   const usedSerie = result.serie ?? settings.serie;
   const now = new Date();
 
-  await prisma.$transaction(async (tx) => {
-    await tx.invoice.update({
-      where: { id: invoiceId },
-      data: {
-        status: invoiceStatus,
-        fiscalEngineRef: result.engineRef,
-        numero: usedNumero,
-        serie: usedSerie,
-        chaveAcesso: result.chaveAcesso,
-        protocolo: result.protocolo,
-        xmlUrl: result.xmlUrl,
-        danfeUrl: result.danfeUrl,
-        valorTotal: input.valorTotal,
-        mensagemSefaz: result.sefazMessage,
-        rejeicaoCodigo: result.rejectionCode,
-        requestPayload:
-          result.rawRequest == null
-            ? Prisma.JsonNull
-            : (result.rawRequest as Prisma.InputJsonValue),
-        responsePayload:
-          result.rawResponse == null
-            ? Prisma.JsonNull
-            : (result.rawResponse as Prisma.InputJsonValue),
-        emittedAt: now,
-        authorizedAt: invoiceStatus === InvoiceStatus.AUTHORIZED ? now : null,
-      },
-    });
-
-    // Avança a numeração só quando autorizou (um número rejeitado pode ser reusado).
-    // FLAG: emissões concorrentes de pedidos diferentes podem pegar o mesmo
-    // proximoNumero — alocação atômica de número fica para o mapeamento fino.
-    if (invoiceStatus === InvoiceStatus.AUTHORIZED) {
-      await tx.fiscalSettings.update({
-        where: { id: settings.id },
-        data: { proximoNumero: usedNumero + 1 },
-      });
-    }
+  await prisma.invoice.update({
+    where: { id: invoiceId },
+    data: {
+      status: invoiceStatus,
+      fiscalEngineRef: result.engineRef,
+      numero: usedNumero,
+      serie: usedSerie,
+      chaveAcesso: result.chaveAcesso,
+      protocolo: result.protocolo,
+      xmlUrl: result.xmlUrl,
+      danfeUrl: result.danfeUrl,
+      valorTotal: input.valorTotal,
+      mensagemSefaz: result.sefazMessage,
+      rejeicaoCodigo: result.rejectionCode,
+      requestPayload:
+        result.rawRequest == null
+          ? Prisma.JsonNull
+          : (result.rawRequest as Prisma.InputJsonValue),
+      responsePayload:
+        result.rawResponse == null
+          ? Prisma.JsonNull
+          : (result.rawResponse as Prisma.InputJsonValue),
+      emittedAt: now,
+      authorizedAt: invoiceStatus === InvoiceStatus.AUTHORIZED ? now : null,
+    },
   });
 
   console.log(

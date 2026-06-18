@@ -88,10 +88,14 @@ export interface EmitInvoiceInput {
   serie: number;
   numero: number;
   naturezaOperacao: string;
+  /** Operation scope (drives CFOP prefix + local_destino). */
+  destinoOperacao: "INTERNA" | "INTERESTADUAL" | "EXTERIOR";
   emitente: EmissionEmitente;
   destinatario: EmissionDestinatario;
   itens: EmissionItem[];
   valorProdutos: number;
+  valorFrete: number;
+  valorDesconto: number;
   valorTotal: number;
   /** Stable key (per shop+order) so the engine call can be made idempotent. */
   idempotencyKey: string;

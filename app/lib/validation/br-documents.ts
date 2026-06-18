@@ -33,6 +33,24 @@ export function isValidCnpj(value: string): boolean {
   return true;
 }
 
+/** Validates a CPF by length, repeated-digit guard, and the two check digits. */
+export function isValidCpf(value: string): boolean {
+  const cpf = onlyDigits(value);
+  if (cpf.length !== 11) return false;
+  if (/^(\d)\1{10}$/.test(cpf)) return false;
+  const checkDigit = (count: number): number => {
+    let sum = 0;
+    for (let i = 0; i < count; i++) {
+      sum += parseInt(cpf.charAt(i), 10) * (count + 1 - i);
+    }
+    const result = (sum * 10) % 11;
+    return result === 10 ? 0 : result;
+  };
+  if (checkDigit(9) !== parseInt(cpf.charAt(9), 10)) return false;
+  if (checkDigit(10) !== parseInt(cpf.charAt(10), 10)) return false;
+  return true;
+}
+
 /** CEP is just 8 digits; ViaCEP confirms it actually exists. */
 export function isValidCep(value: string): boolean {
   return onlyDigits(value).length === 8;
