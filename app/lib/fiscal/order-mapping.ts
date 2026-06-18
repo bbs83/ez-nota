@@ -7,6 +7,7 @@ import { onlyDigits } from "../validation/br-documents";
 import type { CepLookupResult } from "../lookup/types";
 import type { EmissionItem, EmitInvoiceInput } from "./types";
 import type { FiscalOrder } from "./shopify-order.server";
+import { resolveVariantFiscalConfig } from "./variant-fiscal-config.server";
 
 // Maps a normalized FiscalOrder (+ Emitente/FiscalSettings/mappings/ViaCEP) into the
 // engine-agnostic EmitInvoiceInput. No engine wire format here. Returns an error
@@ -28,21 +29,6 @@ export type BuildEmissionResult =
 
 function round2(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
-}
-
-/** NCM em cascata: HS Brasil do variant → ProductFiscalMapping → default. 8 dígitos. */
-function resolveNcm(
-  hsCodeBr: string | null,
-  mapping: ProductFiscalMapping | undefined,
-  settings: FiscalSettings,
-): string | null {
-  const fromHs = onlyDigits(hsCodeBr ?? "");
-  if (fromHs.length === 8) return fromHs;
-  const fromMapping = onlyDigits(mapping?.ncm ?? "");
-  if (fromMapping.length === 8) return fromMapping;
-  const fromDefault = onlyDigits(settings.defaultNcm ?? "");
-  if (fromDefault.length === 8) return fromDefault;
-  return null;
 }
 
 function deriveDestino(
@@ -106,8 +92,13 @@ export function buildEmissionInput(args: {
     const mapping = line.variantId
       ? productMappings.get(line.variantId)
       : undefined;
-    const ncm = resolveNcm(line.hsCodeBr, mapping, settings);
-    if (!ncm) {
+    // Resolução fiscal compartilhada (a mesma que o catálogo usará).
+    const config = resolveVariantFiscalConfig({
+      hsCodeBr: line.hsCodeBr,
+      mapping: mapping ?? null,
+      defaults: settings,
+    });
+    if (config.ncm.source === "none") {
       // Não envia NCM vazio: marca a Invoice como ERROR identificando o produto.
       return {
         ok: false,
@@ -124,10 +115,11 @@ export function buildEmissionInput(args: {
       valorUnitario: line.valorUnitario,
       valorTotal: round2(line.quantidade * line.valorUnitario),
       unidade: "UN", // FLAG
-      ncm,
-      cfop: adjustCfop(mapping?.cfop || settings.defaultCfop, destino),
-      csosn: mapping?.csosn || settings.defaultCsosn,
-      origem: mapping?.origem || settings.defaultOrigem,
+      ncm: config.ncm.value,
+      // CFOP-base resolvido + ajuste por destino (intra/inter) — inalterado.
+      cfop: adjustCfop(config.cfop.value, destino),
+      csosn: config.csosn.value,
+      origem: config.origem.value,
     });
   }
 
