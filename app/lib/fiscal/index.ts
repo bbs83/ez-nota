@@ -17,4 +17,10 @@ export type {
   FiscalEngineAdapter,
   RegisterCompanyInput,
   RegisterCompanyResult,
+  EmitInvoiceInput,
+  EmitInvoiceResult,
+  EmissionStatus,
+  CancelInvoiceInput,
+  CancelInvoiceResult,
+  InvoiceStatusResult,
 } from "./types";
