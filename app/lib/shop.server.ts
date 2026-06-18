@@ -27,3 +27,11 @@ export function getActiveEmitente(shopId: string) {
     where: { shopId, status: EmitenteStatus.ACTIVE },
   });
 }
+
+/** Active Emitente + its FiscalSettings (defaults for the fiscal-config cascade). */
+export function getActiveEmitenteWithSettings(shopId: string) {
+  return prisma.emitente.findFirst({
+    where: { shopId, status: EmitenteStatus.ACTIVE },
+    include: { fiscalSettings: true },
+  });
+}

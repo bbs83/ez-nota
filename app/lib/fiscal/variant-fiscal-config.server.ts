@@ -54,8 +54,9 @@ function pickMappingOrDefault(
 /**
  * Núcleo puro da resolução. Determinístico, sem I/O.
  *
- * NCM (cascata): HS Brasil do variant (8 díg) → ProductFiscalMapping (8 díg) →
- * default (8 díg) → none.
+ * NCM (cascata): ProductFiscalMapping (8 díg) → HS Brasil do variant (8 díg) →
+ * default (8 díg) → none. O override manual do lojista PREVALECE sobre o HS code
+ * do Shopify (HS vira o fallback seguinte).
  * CFOP-base / CSOSN / origem: ProductFiscalMapping (se preenchido) → default.
  */
 export function resolveVariantFiscalConfig(args: {
@@ -65,12 +66,12 @@ export function resolveVariantFiscalConfig(args: {
 }): VariantFiscalConfig {
   const { hsCodeBr, mapping, defaults } = args;
 
-  const hs = onlyDigits(hsCodeBr);
   const mapNcm = onlyDigits(mapping?.ncm);
+  const hs = onlyDigits(hsCodeBr);
   const defNcm = onlyDigits(defaults.defaultNcm);
   let ncm: ResolvedFiscalField;
-  if (hs.length === 8) ncm = { value: hs, source: "shopify_hs" };
-  else if (mapNcm.length === 8) ncm = { value: mapNcm, source: "mapping" };
+  if (mapNcm.length === 8) ncm = { value: mapNcm, source: "mapping" };
+  else if (hs.length === 8) ncm = { value: hs, source: "shopify_hs" };
   else if (defNcm.length === 8) ncm = { value: defNcm, source: "default" };
   else ncm = { value: "", source: "none" };
 
