@@ -32,6 +32,11 @@ function round2(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
+/** NF-e limita xLgr/nro/xBairro/xCpl a 60 caracteres — trunca defensivamente. */
+function trunc60(value: string): string {
+  return value.slice(0, 60);
+}
+
 function deriveDestino(
   emitenteUf: string,
   destUf: string,
@@ -136,13 +141,27 @@ export function buildEmissionInput(args: {
   const address2 = (endereco?.address2 ?? "").trim();
   const complementoDest = address2 || parsedLogradouro.complemento || null;
 
+  // Bairro vem APENAS do ViaCEP (address2 é complemento, não bairro). É campo
+  // obrigatório na NF-e: se o ViaCEP não retornou bairro, não emitir — mesmo
+  // guard do NCM faltando (não enviar documento fiscal com campo obrigatório
+  // vazio). Pega o caso mesmo contra o stub do engine.
+  const bairroDest = (destinatarioCep?.bairro ?? "").trim();
+  if (endereco && !bairroDest) {
+    return {
+      ok: false,
+      error: "Endereço sem bairro — CEP não retornou bairro.",
+    };
+  }
+
+  // NF-e: xLgr/nro/xBairro/xCpl ≤ 60 caracteres — trunca defensivamente.
   const destinatarioEndereco = endereco
     ? {
-        logradouro:
+        logradouro: trunc60(
           parsedLogradouro.logradouro || destinatarioCep?.logradouro || "",
-        numero: parsedLogradouro.numero, // "S/N" quando não identificável
-        complemento: complementoDest,
-        bairro: destinatarioCep?.bairro || address2 || "", // FLAG
+        ),
+        numero: trunc60(parsedLogradouro.numero), // "S/N" quando não identificável
+        complemento: complementoDest ? trunc60(complementoDest) : null,
+        bairro: trunc60(bairroDest), // ViaCEP (obrigatório, validado acima)
         codigoMunicipioIbge: destinatarioCep?.codigoMunicipioIbge || "",
         municipio: destinatarioCep?.municipio || endereco.city || "",
         uf: endereco.provinceCode || destinatarioCep?.uf || "",
