@@ -4,6 +4,7 @@ import type {
   ProductFiscalMapping,
 } from "@prisma/client";
 import { onlyDigits } from "../validation/br-documents";
+import { parseEnderecoLogradouro } from "./address-parsing";
 import type { CepLookupResult } from "../lookup/types";
 import type { EmissionItem, EmitInvoiceInput } from "./types";
 import type { FiscalOrder } from "./shopify-order.server";
@@ -128,12 +129,20 @@ export function buildEmissionInput(args: {
   const valorDesconto = round2(order.valorDesconto);
   const valorTotal = round2(valorProdutos - valorDesconto + valorFrete);
 
+  // Shopify não separa número: extraímos do address1 (heurística conservadora).
+  // complemento: o campo address2 (explícito) tem prioridade; só usamos o texto
+  // que sobrou do address1 (ex.: "fundos") quando address2 está vazio.
+  const parsedLogradouro = parseEnderecoLogradouro(endereco?.address1);
+  const address2 = (endereco?.address2 ?? "").trim();
+  const complementoDest = address2 || parsedLogradouro.complemento || null;
+
   const destinatarioEndereco = endereco
     ? {
-        logradouro: endereco.address1 || destinatarioCep?.logradouro || "",
-        numero: "S/N", // FLAG: Shopify não separa número
-        complemento: endereco.address2 || null,
-        bairro: destinatarioCep?.bairro || endereco.address2 || "", // FLAG
+        logradouro:
+          parsedLogradouro.logradouro || destinatarioCep?.logradouro || "",
+        numero: parsedLogradouro.numero, // "S/N" quando não identificável
+        complemento: complementoDest,
+        bairro: destinatarioCep?.bairro || address2 || "", // FLAG
         codigoMunicipioIbge: destinatarioCep?.codigoMunicipioIbge || "",
         municipio: destinatarioCep?.municipio || endereco.city || "",
         uf: endereco.provinceCode || destinatarioCep?.uf || "",
