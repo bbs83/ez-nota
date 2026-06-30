@@ -55,6 +55,7 @@ export async function resolveInvoice(invoiceId: string): Promise<ResolveOutcome>
       fiscalEngineRef: true,
       numero: true,
       serie: true,
+      cancelRequestedAt: true,
     },
   });
 
@@ -97,6 +98,7 @@ export async function resolveInvoice(invoiceId: string): Promise<ResolveOutcome>
       return "still_processing";
 
     case "AUTHORIZED": {
+      const authorizedAt = new Date();
       const updated = await prisma.invoice.updateMany({
         where: { id: invoice.id, status: InvoiceStatus.PROCESSING },
         data: {
@@ -109,11 +111,29 @@ export async function resolveInvoice(invoiceId: string): Promise<ResolveOutcome>
           danfeUrl: result.danfeUrl,
           mensagemSefaz: result.sefazMessage,
           rejeicaoCodigo: null,
-          authorizedAt: new Date(),
+          authorizedAt,
           responsePayload: jsonOrNull(result.rawResponse),
         },
       });
-      return updated.count > 0 ? "authorized" : "noop";
+      if (updated.count === 0) return "noop";
+
+      // Encadeamento cancel-on-refund: se o pedido foi cancelado/reembolsado enquanto a
+      // nota estava PROCESSING, a intenção ficou em cancelRequestedAt → cancela agora.
+      // Best-effort: a autorização já está persistida, uma falha aqui não a desfaz.
+      if (invoice.cancelRequestedAt) {
+        try {
+          await cancelAuthorizedInvoice({
+            id: invoice.id,
+            fiscalEngineRef: invoice.fiscalEngineRef,
+            authorizedAt,
+          });
+        } catch {
+          console.error(
+            `[resolve] cancelamento encadeado falhou para invoice ${invoice.id}`,
+          );
+        }
+      }
+      return "authorized";
     }
 
     // DENEGADO dobra em REJECTED (enum Prisma não tem DENEGADO; A1). O número
@@ -269,4 +289,169 @@ export async function getProcessingOverview(
     }),
   ]);
   return { processando, atrasadas, cutoffMinutes: PROCESSING_STUCK_MINUTES };
+}
+
+// ===========================================================================
+// Cancel-on-refund — cancela a NF-e quando o pedido é cancelado/reembolsado.
+// Tudo via adapter (fronteira L3); idempotente (update condicional ao estado).
+// ===========================================================================
+
+/** Janela "segura" de cancelamento normal na SEFAZ (~24h após a autorização). */
+const CANCEL_SAFE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Justificativa do cancelamento (a SEFAZ exige 15–255 chars). FLAG: texto e a janela
+ * legal de cancelamento variam por UF — validar com contador.
+ */
+const CANCEL_JUSTIFICATIVA =
+  "Cancelamento por reembolso/cancelamento do pedido no e-commerce";
+
+export type CancelOutcome =
+  | "cancelled" // AUTHORIZED → CANCELLED (homologado pela SEFAZ)
+  | "refused" // SEFAZ recusou; a nota SEGUE AUTHORIZED
+  | "cancel_error" // erro técnico no cancelamento; a nota SEGUE AUTHORIZED
+  | "intent_recorded" // PROCESSING: intenção gravada (cancelRequestedAt)
+  | "noop"; // sem nota / sem nota válida / já cancelada / concorrência
+
+/**
+ * Cancela uma Invoice AUTHORIZED via adapter. Update CONDICIONAL a status = AUTHORIZED
+ * (anti-corrida): só uma chamada efetiva a transição. Recusa/erro mantêm AUTHORIZED e
+ * gravam o motivo em mensagemSefaz. >24h desde a autorização: apenas sinaliza o risco
+ * (loga) e tenta mesmo assim — a SEFAZ é a autoridade sobre o prazo.
+ */
+async function cancelAuthorizedInvoice(invoice: {
+  id: string;
+  fiscalEngineRef: string;
+  authorizedAt: Date | null;
+}): Promise<CancelOutcome> {
+  const now = new Date();
+  if (
+    invoice.authorizedAt &&
+    now.getTime() - invoice.authorizedAt.getTime() > CANCEL_SAFE_WINDOW_MS
+  ) {
+    // Risco: pode ser recusado e exigir nota de devolução. Não bloqueia.
+    console.warn(
+      `[cancel] invoice ${invoice.id}: >24h desde a autorização; cancelamento pode ser recusado`,
+    );
+  }
+
+  // Consulta SEMPRE via adapter (fronteira L3) — nunca o Focus direto.
+  const result = await getFiscalEngine().cancelInvoice({
+    engineRef: invoice.fiscalEngineRef,
+    justificativa: CANCEL_JUSTIFICATIVA,
+  });
+
+  if (result.status === "cancelado") {
+    const updated = await prisma.invoice.updateMany({
+      where: { id: invoice.id, status: InvoiceStatus.AUTHORIZED },
+      data: {
+        status: InvoiceStatus.CANCELLED,
+        cancelledAt: now,
+        protocoloCancelamento: result.protocoloCancelamento,
+        mensagemSefaz: result.sefazMessage,
+        responsePayload: jsonOrNull(result.rawResponse),
+      },
+    });
+    return updated.count > 0 ? "cancelled" : "noop";
+  }
+
+  // Recusa/erro: a nota SEGUE AUTHORIZED. Grava o motivo (condicional a AUTHORIZED para
+  // não sobrescrever uma transição concorrente).
+  await prisma.invoice.updateMany({
+    where: { id: invoice.id, status: InvoiceStatus.AUTHORIZED },
+    data: {
+      mensagemSefaz: result.sefazMessage,
+      responsePayload: jsonOrNull(result.rawResponse),
+    },
+  });
+  console.warn(
+    `[cancel] invoice ${invoice.id}: SEFAZ ${result.status} (status ${result.sefazStatus ?? "?"})`,
+  );
+  return result.status === "recusado" ? "refused" : "cancel_error";
+}
+
+/**
+ * Cancel-on-refund por pedido. Acha a Invoice por shopId:orderId (mesma chave do
+ * idempotencyKey/engineRef) e aplica o tratamento por estado. Idempotente: sinais
+ * repetidos (orders/cancelled E refunds/create do mesmo pedido) não cancelam 2x.
+ */
+export async function cancelInvoiceForOrder(
+  shopId: string,
+  orderId: string,
+): Promise<CancelOutcome> {
+  const idempotencyKey = `${shopId}:${orderId}`;
+  const invoice = await prisma.invoice.findUnique({
+    where: { idempotencyKey },
+    select: { id: true, status: true, fiscalEngineRef: true, authorizedAt: true },
+  });
+  if (!invoice) {
+    console.log(`[cancel] pedido ${orderId}: sem Invoice; nada a cancelar`);
+    return "noop";
+  }
+
+  switch (invoice.status) {
+    case InvoiceStatus.AUTHORIZED:
+      if (!invoice.fiscalEngineRef) {
+        console.error(
+          `[cancel] invoice ${invoice.id} AUTHORIZED sem engineRef; não cancelável`,
+        );
+        return "noop";
+      }
+      return cancelAuthorizedInvoice({
+        id: invoice.id,
+        fiscalEngineRef: invoice.fiscalEngineRef,
+        authorizedAt: invoice.authorizedAt,
+      });
+
+    case InvoiceStatus.PROCESSING: {
+      // Ainda não autorizada → registra a INTENÇÃO (condicional + só se ainda não houver);
+      // o resolver encadeia o cancelamento ao autorizar (PROCESSING→AUTHORIZED).
+      const updated = await prisma.invoice.updateMany({
+        where: {
+          id: invoice.id,
+          status: InvoiceStatus.PROCESSING,
+          cancelRequestedAt: null,
+        },
+        data: { cancelRequestedAt: new Date() },
+      });
+      if (updated.count > 0) {
+        console.log(
+          `[cancel] pedido ${orderId}: nota em PROCESSING; intenção de cancelamento registrada`,
+        );
+      }
+      return "intent_recorded";
+    }
+
+    case InvoiceStatus.REJECTED:
+    case InvoiceStatus.ERROR:
+      // Nunca houve nota válida no SEFAZ → nada a cancelar (no-op fiscal).
+      console.log(
+        `[cancel] pedido ${orderId}: nota ${invoice.status} (sem nota válida); no-op fiscal`,
+      );
+      return "noop";
+
+    case InvoiceStatus.CANCELLED:
+      return "noop"; // idempotente
+
+    default: // PENDING ou estado inesperado
+      console.log(`[cancel] pedido ${orderId}: status ${invoice.status}; no-op`);
+      return "noop";
+  }
+}
+
+/**
+ * Reembolso PARCIAL: NÃO cancela a NF-e (documento do pedido inteiro). Apenas sinaliza
+ * partialRefundAt para visibilidade/auditoria — devolução parcial é fluxo futuro (nota
+ * de devolução). Idempotente (só marca se ainda não marcado).
+ */
+export async function markPartialRefundForOrder(
+  shopId: string,
+  orderId: string,
+): Promise<boolean> {
+  const idempotencyKey = `${shopId}:${orderId}`;
+  const updated = await prisma.invoice.updateMany({
+    where: { idempotencyKey, partialRefundAt: null },
+    data: { partialRefundAt: new Date() },
+  });
+  return updated.count > 0;
 }

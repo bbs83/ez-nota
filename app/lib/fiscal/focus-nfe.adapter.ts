@@ -145,6 +145,17 @@ function magicOutcome(ref: string): "rejeitado" | "denegado" | null {
   return null;
 }
 
+/**
+ * Simulação DETERMINÍSTICA de RECUSA de cancelamento (mesmo espírito do magicOutcome):
+ * o orderId (parte do ref após o último ":") terminando em "99" → SEFAZ RECUSA o
+ * cancelamento (ex.: prazo expirado). Qualquer outro sufixo → cancelamento homologado.
+ * Não colide com 13/66 (esses nem chegam a AUTHORIZED para serem cancelados).
+ */
+function magicCancelOutcome(ref: string): "recusado" | null {
+  const orderId = ref.includes(":") ? ref.slice(ref.lastIndexOf(":") + 1) : ref;
+  return /99$/.test(orderId) ? "recusado" : null;
+}
+
 export class FocusNfeAdapter implements FiscalEngineAdapter {
   /** Per-ref simulation state for the async stub (see getInvoiceStatus). */
   private readonly stubDocs = new Map<string, StubDoc>();
@@ -199,11 +210,40 @@ export class FocusNfeAdapter implements FiscalEngineAdapter {
   }
 
   async cancelInvoice(input: CancelInvoiceInput): Promise<CancelInvoiceResult> {
-    // TODO(focus): DELETE /v2/nfe/{ref} com { justificativa }.
+    // TODO(focus): DELETE /v2/nfe/{ref} com { justificativa } → evento de cancelamento.
+    // Não logar a justificativa nem o ref cru (podem correlacionar a pedido) — L8.
+    const token = process.env.FOCUS_API_TOKEN;
+    if (!token) {
+      console.warn("[FocusNfeAdapter] FOCUS_API_TOKEN ausente; cancelInvoice em modo stub.");
+    }
+
+    // STUB: sucesso por padrão; RECUSA determinística por sufixo do ref (ver
+    // magicCancelOutcome) para exercitar o ramo "SEFAZ recusou o cancelamento".
+    if (magicCancelOutcome(input.engineRef) === "recusado") {
+      return {
+        status: "recusado",
+        protocoloCancelamento: null,
+        sefazStatus: "501",
+        sefazMessage:
+          "Rejeição: prazo para cancelamento superior ao permitido na legislação",
+        rawResponse: {
+          status: "erro_cancelamento",
+          status_sefaz: "501",
+          ref: input.engineRef,
+        },
+      };
+    }
+
     return {
-      status: "CANCELLED",
-      sefazMessage: "Cancelamento registrado (stub)",
-      rawResponse: { status: "cancelado", ref: input.engineRef },
+      status: "cancelado",
+      protocoloCancelamento: `135${input.engineRef.replace(/\D/g, "")}`.slice(0, 15),
+      sefazStatus: "135",
+      sefazMessage: "Evento registrado e vinculado à NF-e (cancelamento homologado)",
+      rawResponse: {
+        status: "cancelado",
+        status_sefaz: "135",
+        ref: input.engineRef,
+      },
     };
   }
 

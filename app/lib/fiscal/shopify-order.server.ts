@@ -127,6 +127,24 @@ export const ORDER_QUERY = `#graphql
   }
 `;
 
+// Consulta enxuta para classificar um refund: integral vs parcial. Campos + scope
+// (read_orders) validados via Dev MCP (Admin 2026-04).
+export const ORDER_REFUND_STATUS_QUERY = `#graphql
+  query OrderRefundStatus($id: ID!) {
+    order(id: $id) {
+      id
+      displayFinancialStatus
+      totalRefundedSet { shopMoney { amount } }
+      totalPriceSet { shopMoney { amount } }
+    }
+  }
+`;
+
+export interface OrderRefundStatus {
+  /** True se o pedido está INTEGRALMENTE reembolsado (→ elegível a cancelar a NF-e). */
+  fullyRefunded: boolean;
+}
+
 function num(value: unknown): number {
   const n = parseFloat(String(value ?? ""));
   return Number.isFinite(n) ? n : 0;
@@ -304,6 +322,42 @@ export async function fetchFiscalOrder(
   const order = body?.data?.order;
   if (!order) throw new Error("Order not found");
   return normalizeGqlOrder(order);
+}
+
+/**
+ * Classifica um refund: integral vs parcial. Integral = displayFinancialStatus REFUNDED
+ * OU total reembolsado >= total do pedido. Lança em erro de GraphQL / pedido ausente
+ * (L5) para o chamador reenfileirar (reenvio do webhook). Não logar os valores (L8).
+ */
+export async function fetchOrderRefundStatus(
+  admin: AdminGraphqlClient,
+  orderGid: string,
+): Promise<OrderRefundStatus> {
+  const response = await admin.graphql(ORDER_REFUND_STATUS_QUERY, {
+    variables: { id: orderGid },
+  });
+  const body = (await response.json()) as {
+    data?: {
+      order?: {
+        displayFinancialStatus?: string | null;
+        totalRefundedSet?: GqlMoney | null;
+        totalPriceSet?: GqlMoney | null;
+      } | null;
+    };
+    errors?: unknown[];
+  };
+  if (Array.isArray(body.errors) && body.errors.length > 0) {
+    throw new Error("GraphQL errors querying order refund status");
+  }
+  const order = body?.data?.order;
+  if (!order) throw new Error("Order not found");
+
+  const refunded = num(order.totalRefundedSet?.shopMoney?.amount);
+  const total = num(order.totalPriceSet?.shopMoney?.amount);
+  const fullyRefunded =
+    (order.displayFinancialStatus ?? "") === "REFUNDED" ||
+    (total > 0 && refunded >= total);
+  return { fullyRefunded };
 }
 
 /** Fallback: build from the webhook payload (no NCM-by-variant; CPF only via note_attributes). */

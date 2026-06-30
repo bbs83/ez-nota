@@ -230,6 +230,14 @@ model Invoice {
   emittedAt        DateTime?
   authorizedAt     DateTime?
   cancelledAt      DateTime?
+  // Cancelamento (cancel-on-refund). protocoloCancelamento = protocolo do evento de
+  // cancelamento na SEFAZ. cancelRequestedAt = intenção registrada quando o pedido é
+  // cancelado/reembolsado enquanto a nota ainda está PROCESSING (o resolver encadeia o
+  // cancelamento ao autorizar). partialRefundAt = reembolso PARCIAL sinalizado (não
+  // cancela a NF-e; devolução é fluxo futuro).
+  protocoloCancelamento String?
+  cancelRequestedAt DateTime?
+  partialRefundAt   DateTime?
   // Rastreio da reconciliação PROCESSING→terminal (M1). resolveAttempts conta as
   // tentativas de resolução; lastResolveAt marca a última consulta ao engine — não
   // dá para usar updatedAt, pois uma consulta "ainda processando" não escreve a nota.

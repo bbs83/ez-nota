@@ -136,10 +136,22 @@ export interface EmitInvoiceResult {
 
 export interface CancelInvoiceInput {
   engineRef: string;
+  /** Justificativa do cancelamento na SEFAZ (15–255 chars). */
   justificativa: string;
 }
+
+/** Desfecho normalizado de um pedido de cancelamento na SEFAZ. */
+export type CancelStatus =
+  | "cancelado" // evento de cancelamento homologado pela SEFAZ
+  | "recusado" // SEFAZ recusou (ex.: prazo expirado, nota não autorizada)
+  | "erro"; // falha técnica/transitória ao processar o cancelamento
+
 export interface CancelInvoiceResult {
-  status: EmissionStatus;
+  status: CancelStatus;
+  /** Protocolo do evento de cancelamento, quando homologado. */
+  protocoloCancelamento: string | null;
+  /** Código de status SEFAZ (ex.: "135" homologado, "501" prazo expirado). */
+  sefazStatus: string | null;
   sefazMessage: string | null;
   rawResponse: unknown;
 }

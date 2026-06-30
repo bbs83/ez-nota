@@ -48,6 +48,14 @@ api_version = "2026-07"
   uri = "/webhooks/orders/paid"
   topics = [ "orders/paid" ]
 
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/cancelled"
+  topics = [ "orders/cancelled" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/refunds/create"
+  topics = [ "refunds/create" ]
+
 [auth]
 redirect_urls = [ "https://example.com/api/auth" ]
 
