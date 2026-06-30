@@ -20,6 +20,18 @@ export type ResolveOutcome =
   | "error"
   | "cancelled";
 
+/**
+ * Tempo (min) após o qual uma nota ainda em PROCESSING é considerada atrasada/presa.
+ * PROVISÓRIO: a SEFAZ normalmente autoriza em segundos/minutos; 30 min é folga
+ * (fila/contingência). Ajustar quando houver métrica real do Focus.
+ */
+export const PROCESSING_STUCK_MINUTES = 30;
+
+/** Data de corte: notas em PROCESSING criadas antes disso estão "atrasadas". */
+function stuckCutoff(now: Date): Date {
+  return new Date(now.getTime() - PROCESSING_STUCK_MINUTES * 60_000);
+}
+
 /** responsePayload: grava JSON ou JsonNull (mesmo padrão do invoice.server). */
 function jsonOrNull(value: unknown) {
   return value == null ? Prisma.JsonNull : (value as Prisma.InputJsonValue);
@@ -50,18 +62,31 @@ export async function resolveInvoice(invoiceId: string): Promise<ResolveOutcome>
   // rebaixa AUTHORIZED (decisão #4).
   if (!invoice || invoice.status !== InvoiceStatus.PROCESSING) return "noop";
 
+  const now = new Date();
+
   // PROCESSING sem ref do engine não é consultável → ERROR (reemissível). Update
-  // condicional para não rebaixar uma resolução concorrente.
+  // condicional para não rebaixar uma resolução concorrente. Conta como tentativa.
   if (!invoice.fiscalEngineRef) {
     const updated = await prisma.invoice.updateMany({
       where: { id: invoice.id, status: InvoiceStatus.PROCESSING },
       data: {
         status: InvoiceStatus.ERROR,
         mensagemSefaz: "Nota em processamento sem referência do provedor fiscal.",
+        resolveAttempts: { increment: 1 },
+        lastResolveAt: now,
       },
     });
     return updated.count > 0 ? "error" : "noop";
   }
+
+  // Stamp da tentativa ANTES da consulta: registra resolveAttempts + lastResolveAt
+  // mesmo que o engine exploda (a Invoice segue PROCESSING, mas a tentativa fica
+  // marcada p/ a detecção de "presa"). Condicional a PROCESSING; os updates terminais
+  // abaixo NÃO re-incrementam (evita dupla contagem).
+  await prisma.invoice.updateMany({
+    where: { id: invoice.id, status: InvoiceStatus.PROCESSING },
+    data: { resolveAttempts: { increment: 1 }, lastResolveAt: now },
+  });
 
   // Consulta SEMPRE via adapter (fronteira L3) — nunca o Focus direto.
   const result = await getFiscalEngine().getInvoiceStatus(invoice.fiscalEngineRef);
@@ -142,6 +167,8 @@ export interface ReconcileSummary {
   aindaProcessando: number;
   rejeitadas: number;
   erros: number;
+  /** Notas ainda em PROCESSING e acima do cutoff APÓS a varredura (presas/atrasadas). */
+  stuck: number;
 }
 
 /**
@@ -154,9 +181,10 @@ export async function reconcilePendingInvoices(
   shopId: string,
   limite = 50,
 ): Promise<ReconcileSummary> {
+  const now = new Date();
   const pending = await prisma.invoice.findMany({
     where: { shopId, status: InvoiceStatus.PROCESSING },
-    orderBy: { createdAt: "asc" },
+    orderBy: { createdAt: "asc" }, // mais antigas (mais prováveis de estarem presas) primeiro
     take: limite,
     select: { id: true },
   });
@@ -166,6 +194,7 @@ export async function reconcilePendingInvoices(
     aindaProcessando: 0,
     rejeitadas: 0,
     erros: 0,
+    stuck: 0,
   };
 
   for (const { id } of pending) {
@@ -199,5 +228,45 @@ export async function reconcilePendingInvoices(
     }
   }
 
+  // "Presas": ainda PROCESSING e acima do cutoff DEPOIS da varredura. Releitura do
+  // estado pós-resolução (não dá para inferir do loop: notas além do `limite` também
+  // contam, e o cutoff é por idade, não por desfecho desta passada).
+  summary.stuck = await prisma.invoice.count({
+    where: {
+      shopId,
+      status: InvoiceStatus.PROCESSING,
+      createdAt: { lt: stuckCutoff(now) },
+    },
+  });
+
   return summary;
+}
+
+/** Visão agregada das notas em processamento de um shop (para a home). */
+export interface ProcessingOverview {
+  processando: number;
+  atrasadas: number;
+  cutoffMinutes: number;
+}
+
+/**
+ * Conta as notas em PROCESSING e, dentro delas, as "atrasadas" (acima do cutoff).
+ * Centraliza o uso do enum Prisma no servidor (a rota não importa valores do
+ * @prisma/client — regra "Prisma no client").
+ */
+export async function getProcessingOverview(
+  shopId: string,
+): Promise<ProcessingOverview> {
+  const now = new Date();
+  const [processando, atrasadas] = await Promise.all([
+    prisma.invoice.count({ where: { shopId, status: InvoiceStatus.PROCESSING } }),
+    prisma.invoice.count({
+      where: {
+        shopId,
+        status: InvoiceStatus.PROCESSING,
+        createdAt: { lt: stuckCutoff(now) },
+      },
+    }),
+  ]);
+  return { processando, atrasadas, cutoffMinutes: PROCESSING_STUCK_MINUTES };
 }

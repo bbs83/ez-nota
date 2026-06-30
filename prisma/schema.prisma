@@ -230,6 +230,11 @@ model Invoice {
   emittedAt        DateTime?
   authorizedAt     DateTime?
   cancelledAt      DateTime?
+  // Rastreio da reconciliação PROCESSING→terminal (M1). resolveAttempts conta as
+  // tentativas de resolução; lastResolveAt marca a última consulta ao engine — não
+  // dá para usar updatedAt, pois uma consulta "ainda processando" não escreve a nota.
+  resolveAttempts  Int           @default(0)
+  lastResolveAt    DateTime?
   createdAt        DateTime      @default(now())
   updatedAt        DateTime      @updatedAt
 

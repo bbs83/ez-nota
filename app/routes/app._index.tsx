@@ -8,9 +8,11 @@ import { useFetcher, useLoaderData } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
-import prisma from "../db.server";
 import { getActiveEmitente, getOrCreateShop } from "../lib/shop.server";
-import { reconcilePendingInvoices } from "../lib/invoice-resolver.server";
+import {
+  getProcessingOverview,
+  reconcilePendingInvoices,
+} from "../lib/invoice-resolver.server";
 
 // Home. If the shop has not completed onboarding (no ACTIVE Emitente), send them
 // to the wizard. Otherwise show the (placeholder) dashboard + a manual trigger to
@@ -21,17 +23,16 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const emitente = await getActiveEmitente(shop.id);
   if (!emitente) return redirect("/app/onboarding");
 
-  // status literal "PROCESSING" (sem importar valores do @prisma/client na rota).
-  const processando = await prisma.invoice.count({
-    where: { shopId: shop.id, status: "PROCESSING" },
-  });
+  const overview = await getProcessingOverview(shop.id);
 
   return {
     razaoSocial: emitente.razaoSocial,
     cnpj: emitente.cnpj,
     municipio: emitente.municipio,
     uf: emitente.uf,
-    processando,
+    processando: overview.processando,
+    atrasadas: overview.atrasadas,
+    cutoffMinutes: overview.cutoffMinutes,
   };
 };
 
@@ -45,7 +46,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function Index() {
-  const { razaoSocial, cnpj, municipio, uf, processando } =
+  const { razaoSocial, cnpj, municipio, uf, processando, atrasadas, cutoffMinutes } =
     useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
@@ -57,11 +58,13 @@ export default function Index() {
     if (processedResult.current === fetcher.data) return;
     processedResult.current = fetcher.data;
     const s = fetcher.data.summary;
+    const atraso =
+      s.stuck > 0 ? ` ${s.stuck} há mais de ${cutoffMinutes} min.` : "";
     shopify.toast.show(
       `Verificação concluída: ${s.resolvidas} autorizada(s), ${s.rejeitadas} rejeitada(s), ` +
-        `${s.aindaProcessando} ainda processando, ${s.erros} erro(s).`,
+        `${s.aindaProcessando} ainda processando, ${s.erros} erro(s).${atraso}`,
     );
-  }, [fetcher.state, fetcher.data, shopify]);
+  }, [fetcher.state, fetcher.data, cutoffMinutes, shopify]);
 
   const busy = fetcher.state !== "idle";
 
@@ -89,6 +92,14 @@ export default function Index() {
               ? "Nenhuma nota aguardando autorização da SEFAZ."
               : `${processando} nota(s) aguardando autorização da SEFAZ.`}
           </s-paragraph>
+
+          {atrasadas > 0 ? (
+            <s-banner tone="warning">
+              {atrasadas} nota(s) há mais de {cutoffMinutes} min em processamento.
+              Verifique novamente; se persistir, entre em contato com o suporte.
+            </s-banner>
+          ) : null}
+
           <s-button
             onClick={() => fetcher.submit({}, { method: "post" })}
             {...(busy ? { loading: true } : {})}
