@@ -18,6 +18,9 @@ const TO_INVOICE_STATUS: Record<EmissionStatus, InvoiceStatus> = {
   AUTHORIZED: InvoiceStatus.AUTHORIZED,
   PROCESSING: InvoiceStatus.PROCESSING,
   REJECTED: InvoiceStatus.REJECTED,
+  // Prisma InvoiceStatus não tem DENEGADO; persistimos como REJECTED (o
+  // rejeicaoCodigo/mensagemSefaz preservam o motivo da denegação).
+  DENEGADO: InvoiceStatus.REJECTED,
   CANCELLED: InvoiceStatus.CANCELLED,
   ERROR: InvoiceStatus.ERROR,
 };
@@ -46,8 +49,11 @@ function markInvoiceError(invoiceId: string, message: string) {
  * Order data is enriched via Admin GraphQL (CPF via localizedFields, NCM via the
  * variant's HS code). LGPD/L8: never log CPF/address.
  *
- * NOTE: emission runs synchronously; with the real Focus integration this should
- * move to a queue (+ poll processando→autorizado, + recover stuck PROCESSING) — M1.
+ * Emission is ASYNCHRONOUS (mirrors real Focus): emitInvoice returns PROCESSING +
+ * an engineRef, so the Invoice STOPS at PROCESSING here (status, fiscalEngineRef and
+ * the reserved número are persisted). The terminal state (autorizado/rejeitado/
+ * denegado) is resolved later by polling getInvoiceStatus(engineRef) — that resolver
+ * + stuck-PROCESSING reclaim is M1 (next chunk; no auto-trigger yet).
  */
 export async function handleOrderPaid(
   shopDomain: string,
@@ -200,7 +206,7 @@ export async function handleOrderPaid(
   const numero = reserved.proximoNumero - 1;
   const input: EmitInvoiceInput = { ...build.input, numero };
 
-  // --- Emissão via adapter (stub) ---
+  // --- Emissão via adapter (stub): assíncrona → resultado PROCESSING + engineRef ---
   let result: EmitInvoiceResult;
   try {
     result = await getFiscalEngine().emitInvoice(input);

@@ -9,12 +9,17 @@ import type {
   RegisterCompanyInput,
   RegisterCompanyResult,
 } from "./types";
-import { buildFocusNfePayload, type FocusNfePayload } from "./nfe-payload";
+import { buildFocusNfePayload } from "./nfe-payload";
 
 // Concrete adapter for Focus NFe (https://focusnfe.com.br). Network calls are still
-// STUBBED, but the parsing path is real: emitInvoice builds the real Focus payload,
-// produces a Focus-shaped "autorizado" response, and runs it through the same
-// parser the live integration will use (high fidelity). Auth will use FOCUS_API_TOKEN.
+// STUBBED, but the parsing path is real: emitInvoice builds the real Focus payload
+// and runs Focus-shaped responses through the same parser the live integration will
+// use (high fidelity). Auth will use FOCUS_API_TOKEN.
+//
+// ASYNCHRONOUS by design, mirroring real Focus: emitInvoice returns
+// "processando_autorizacao" + a ref; the terminal state (autorizado/rejeitado/
+// denegado) is observed later via getInvoiceStatus(ref). The stub fakes this with
+// an in-memory poll counter — see getInvoiceStatus.
 //
 // IMPORTANT: callers reach this only through getFiscalEngine() (see ./index); the
 // Focus wire format never escapes this file + nfe-payload.ts. NEVER log the request
@@ -45,8 +50,9 @@ function mapFocusStatus(status: string): EmissionStatus {
       return "PROCESSING";
     case "cancelado":
       return "CANCELLED";
+    case "denegado":
+      return "DENEGADO";
     case "erro_autorizacao":
-    case "denegado": // SEFAZ denied; nosso enum não tem DENEGADO → REJECTED
       return "REJECTED";
     default:
       return "ERROR";
@@ -82,12 +88,67 @@ function parseFocusResponse(
 }
 
 /** Deterministic fake 44-digit access key so the stub looks realistic. */
-function fakeChave(payload: FocusNfePayload): string {
-  const seed = `3524${payload.cnpj_emitente}55${payload.items.length}`;
+function fakeChave(cnpjEmitente: string, itemCount: number): string {
+  const seed = `3524${cnpjEmitente}55${itemCount}`;
   return (seed + "0".repeat(44)).slice(0, 44);
 }
 
+/**
+ * Projects a Focus consultation response into the engine-agnostic InvoiceStatusResult.
+ * Reuses parseFocusResponse so the status mapping + field extraction live in one place.
+ */
+function toStatusResult(resp: FocusNfeResponse): InvoiceStatusResult {
+  const r = parseFocusResponse(resp, null);
+  return {
+    status: r.status,
+    chaveAcesso: r.chaveAcesso,
+    numero: r.numero,
+    serie: r.serie,
+    protocolo: r.protocolo,
+    xmlUrl: r.xmlUrl,
+    danfeUrl: r.danfeUrl,
+    sefazStatus: r.sefazStatus,
+    sefazMessage: r.sefazMessage,
+    rejectionCode: r.rejectionCode,
+    rawResponse: r.rawResponse,
+  };
+}
+
+// --- Stub async simulation (in-memory, per-process) -----------------------
+// State kept ONLY by the stub so the asynchronous flow can be exercised end to end
+// before the real Focus HTTP lands. Lost on restart (acceptable for dev/test).
+interface StubDoc {
+  polls: number;
+  numero: number | null;
+  serie: number | null;
+  cnpjEmitente: string;
+  itemCount: number;
+}
+
+/** Nº de consultas que respondem "processando" antes de virar terminal. */
+const STUB_PROCESSING_POLLS = 1;
+
+/**
+ * Simulação DETERMINÍSTICA de desfecho (no espírito do bogus gateway do Shopify):
+ * o desfecho depende dos ÚLTIMOS DÍGITOS do orderId (parte do ref após o último ":").
+ *   - termina em "13"  → REJEITADO  (erro_autorizacao)
+ *   - termina em "66"  → DENEGADO   (SEFAZ nega por irregularidade fiscal)
+ *   - qualquer outro   → AUTORIZADO
+ * Para forçar um desfecho num teste, basta o ref/idempotencyKey terminar no marcador
+ * (ex.: "shop_x:99913" rejeita). Refs reais raramente colidem; em produção o stub é
+ * substituído pelo HTTP real do Focus.
+ */
+function magicOutcome(ref: string): "rejeitado" | "denegado" | null {
+  const orderId = ref.includes(":") ? ref.slice(ref.lastIndexOf(":") + 1) : ref;
+  if (/13$/.test(orderId)) return "rejeitado";
+  if (/66$/.test(orderId)) return "denegado";
+  return null;
+}
+
 export class FocusNfeAdapter implements FiscalEngineAdapter {
+  /** Per-ref simulation state for the async stub (see getInvoiceStatus). */
+  private readonly stubDocs = new Map<string, StubDoc>();
+
   async registerCompany(
     emitente: RegisterCompanyInput,
     _certPfx: Buffer,
@@ -108,26 +169,30 @@ export class FocusNfeAdapter implements FiscalEngineAdapter {
     const payload = buildFocusNfePayload(input);
 
     // TODO(focus): POST /v2/nfe?ref=<idempotencyKey> com `payload` e o token da
-    // empresa. A resposta real pode vir "processando_autorizacao" → o polling
-    // (processando → autorizado/rejeitado) é o próximo chunk. Não logar `payload`.
+    // empresa. A resposta real costuma vir "processando_autorizacao"; o polling
+    // (processando → autorizado/rejeitado) acontece em getInvoiceStatus. Não logar `payload`.
     const token = process.env.FOCUS_API_TOKEN;
     if (!token) {
       console.warn("[FocusNfeAdapter] FOCUS_API_TOKEN ausente; emitInvoice em modo stub.");
     }
 
-    // STUB de alta fidelidade: resposta no formato real do Focus para "autorizado".
+    const ref = input.idempotencyKey;
+    // Guarda o contexto da emissão para que getInvoiceStatus produza um "autorizado"
+    // consistente (mesma chave/numero/serie) ao final do polling.
+    this.stubDocs.set(ref, {
+      polls: 0,
+      numero: input.numero,
+      serie: input.serie,
+      cnpjEmitente: payload.cnpj_emitente,
+      itemCount: payload.items.length,
+    });
+
+    // STUB assíncrono: resposta no formato real do Focus para "enfileirado". Sem
+    // chave/numero/protocolo ainda — esses só existem após autorização na SEFAZ.
     const stubResponse: FocusNfeResponse = {
-      status: "autorizado",
-      ref: input.idempotencyKey,
+      status: "processando_autorizacao",
+      ref,
       cnpj_emitente: payload.cnpj_emitente,
-      chave_nfe: fakeChave(payload),
-      numero: String(input.numero),
-      serie: String(input.serie),
-      caminho_xml_nota_fiscal: `/arquivos/${input.idempotencyKey}/nfe.xml`,
-      caminho_danfe: `/arquivos/${input.idempotencyKey}/danfe.pdf`,
-      status_sefaz: "100",
-      mensagem_sefaz: "Autorizado o uso da NF-e",
-      protocolo: `135${payload.cnpj_emitente}${input.numero}`.slice(0, 15),
     };
 
     return parseFocusResponse(stubResponse, payload);
@@ -143,14 +208,55 @@ export class FocusNfeAdapter implements FiscalEngineAdapter {
   }
 
   async getInvoiceStatus(engineRef: string): Promise<InvoiceStatusResult> {
-    // TODO(focus): GET /v2/nfe/{ref} e mapear `status` → EmissionStatus.
-    return {
-      status: "AUTHORIZED",
-      chaveAcesso: null,
-      xmlUrl: null,
-      danfeUrl: null,
-      sefazMessage: "Autorizado o uso da NF-e (stub)",
-      rawResponse: { status: "autorizado", ref: engineRef },
+    // TODO(focus): GET /v2/nfe/{ref}; mapear `status` → EmissionStatus via parseFocusResponse.
+
+    // STUB assíncrono: as primeiras STUB_PROCESSING_POLLS consultas respondem
+    // "processando"; depois o desfecho terminal. Desfecho determinístico por ref —
+    // ver magicOutcome (rejeição/denegação por sufixo do orderId).
+    const doc = this.stubDocs.get(engineRef) ?? {
+      polls: 0,
+      numero: null,
+      serie: null,
+      cnpjEmitente: "",
+      itemCount: 1,
     };
+    doc.polls += 1;
+    this.stubDocs.set(engineRef, doc);
+
+    if (doc.polls <= STUB_PROCESSING_POLLS) {
+      return toStatusResult({ status: "processando_autorizacao", ref: engineRef });
+    }
+
+    switch (magicOutcome(engineRef)) {
+      case "rejeitado":
+        return toStatusResult({
+          status: "erro_autorizacao",
+          ref: engineRef,
+          status_sefaz: "225",
+          mensagem_sefaz: "Rejeição: Falha no schema XML da NF-e",
+          erros: [{ codigo: "225", mensagem: "Rejeição: Falha no schema XML da NF-e" }],
+        });
+      case "denegado":
+        return toStatusResult({
+          status: "denegado",
+          ref: engineRef,
+          status_sefaz: "302",
+          mensagem_sefaz: "Denegado: Irregularidade fiscal do destinatário",
+        });
+      default:
+        return toStatusResult({
+          status: "autorizado",
+          ref: engineRef,
+          cnpj_emitente: doc.cnpjEmitente,
+          chave_nfe: fakeChave(doc.cnpjEmitente, doc.itemCount),
+          numero: doc.numero != null ? String(doc.numero) : undefined,
+          serie: doc.serie != null ? String(doc.serie) : undefined,
+          caminho_xml_nota_fiscal: `/arquivos/${engineRef}/nfe.xml`,
+          caminho_danfe: `/arquivos/${engineRef}/danfe.pdf`,
+          status_sefaz: "100",
+          mensagem_sefaz: "Autorizado o uso da NF-e",
+          protocolo: `135${doc.cnpjEmitente}${doc.numero ?? ""}`.slice(0, 15),
+        });
+    }
   }
 }

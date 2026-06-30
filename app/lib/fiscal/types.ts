@@ -101,11 +101,17 @@ export interface EmitInvoiceInput {
   idempotencyKey: string;
 }
 
-/** Engine-agnostic emission status. The caller maps this to InvoiceStatus. */
+/**
+ * Engine-agnostic emission status. The caller maps this to InvoiceStatus.
+ * DENEGADO (SEFAZ denial — irregularidade fiscal) is kept distinct from REJECTED
+ * at the engine boundary; the Prisma InvoiceStatus has no DENEGADO, so the caller
+ * folds it into REJECTED for persistence (see TO_INVOICE_STATUS).
+ */
 export type EmissionStatus =
   | "AUTHORIZED"
   | "PROCESSING"
   | "REJECTED"
+  | "DENEGADO"
   | "CANCELLED"
   | "ERROR";
 
@@ -138,12 +144,25 @@ export interface CancelInvoiceResult {
   rawResponse: unknown;
 }
 
+/**
+ * Result of polling the engine for a document's terminal state (by engineRef).
+ * AUTHORIZED carries chave/numero/serie/protocolo + xml/danfe links; REJECTED/
+ * DENEGADO carry sefazStatus + sefazMessage + rejectionCode. Fields not relevant
+ * to the current status are null. Mirrors EmitInvoiceResult (minus engineRef/
+ * rawRequest) so the caller persists it with the same mapping.
+ */
 export interface InvoiceStatusResult {
   status: EmissionStatus;
   chaveAcesso: string | null;
+  numero: number | null;
+  serie: number | null;
+  protocolo: string | null;
   xmlUrl: string | null;
   danfeUrl: string | null;
+  /** SEFAZ status code (e.g. "100" authorized, "302" denied) + message. */
+  sefazStatus: string | null;
   sefazMessage: string | null;
+  rejectionCode: string | null;
   rawResponse: unknown;
 }
 
@@ -159,7 +178,16 @@ export interface FiscalEngineAdapter {
     certPassword: string,
   ): Promise<RegisterCompanyResult>;
 
+  /**
+   * Submits the NF-e to the engine. ASYNCHRONOUS by contract: the engine queues
+   * the document at SEFAZ and returns PROCESSING + an engineRef (never a terminal
+   * AUTHORIZED). The terminal state (autorizado/rejeitado/denegado) is obtained
+   * later via getInvoiceStatus(engineRef). The caller persists the Invoice in
+   * PROCESSING and polls. (Focus may occasionally answer synchronously, but the
+   * contract assumes async — see CLAUDE.md M1.)
+   */
   emitInvoice(input: EmitInvoiceInput): Promise<EmitInvoiceResult>;
   cancelInvoice(input: CancelInvoiceInput): Promise<CancelInvoiceResult>;
+  /** Polls the engine for the document's current/terminal state by its engineRef. */
   getInvoiceStatus(engineRef: string): Promise<InvoiceStatusResult>;
 }
