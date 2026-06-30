@@ -85,7 +85,9 @@ multi-CNPJ, Pix discount module, NFS-e (services) if needed.
 - Extrair validTo do certificado (resposta do Focus ou node-forge) para o alerta de expiração — decisão #2 (L7).
 - Projetar emit/cancel/getStatus de forma agnóstica antes de acoplar ao Focus (trocar engine sem refactor) (L3).
 - Deploy: validar transação interativa sob o transaction pooler no Vercel; se falhar, escrever via session pooler/DIRECT_URL (M5).
-- M1: recuperar Invoice presa em PROCESSING (reclaim se updatedAt < cutoff + job de reconciliação) — junto com o assíncrono do Focus.
+- M1: emissão assíncrona — emitInvoice retorna PROCESSING + engineRef (Invoice para em PROCESSING); resolveInvoice/reconcilePendingInvoices (invoice-resolver.server.ts) transicionam para o terminal via adapter.getInvoiceStatus. FEITO: resolver idempotente + varredura + disparo MANUAL (botão na home). PENDENTE (próxima task): reclaim de Invoice presa (updatedAt < cutoff) e tratamento do caso PROCESSING-órfão.
+- Inutilização de número em rejeição: número rejeitado/denegado é "queimado" (gap aceitável, decisão #4); o resolver NÃO mexe no número. TODO: inutilizar a numeração rejeitada na SEFAZ via engine.
+- Gatilho automático (cron/callback do Focus) para a reconciliação: entra no DEPLOY (hoje a varredura é só manual). Avaliar cron na Vercel vs. webhook/callback de status do Focus.
 - M5: requestPayload retém PII do destinatário (CPF, endereço, email e telefone) — na compliance: redigir PII do payload persistido (autoritativo é o XML no Focus) + retenção/purga + inventário de dados.
 - M6: CFOP explícito intra/inter por cenário (no catálogo), em vez de heurística de prefixo.
 - L2/L3: reconciliar total com lojas tax-exclusive; indicador_IE/IE de destinatário B2B (CNPJ contribuinte).
